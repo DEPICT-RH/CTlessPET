@@ -4,7 +4,7 @@
 `pip install CTlessPET`
 
 ## Use
-CTlessPET only requires an NAC-PET dataset and a CT dataset. The CT is used as the container for the synthetic CT, and can be an empty CT acquired before the patient enters the scanner. The NAC-PET should be reconstructed using OSEM with Time-of-Flight enabled.
+CTlessPET only requires an NAC-PET dataset and a CT dataset. The CT is used as the container for the synthetic CT, and can be an empty CT acquired before the patient enters the scanner. The NAC-PET should be reconstructed using OSEM with Time-of-Flight enabled but no PSF modeling. Reconstruction at should be at 440x440 matrix size with a 4 mm Gaussian post filter. Only Siemens Bigraph Vision scanners (including the Quarda) are supported.
 
 ### Dicom data
 Using a folder containing both NAC and CT data:
