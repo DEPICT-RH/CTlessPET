@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "CTlessPET"
-version = "0.0.2"
+version = "0.2.1"
 authors = [
     { name="Claes Ladefoged", email="claes.noehr.ladefoged@regionh.dk" },
 ]
@@ -42,5 +42,6 @@ exclude = [
     "/models",
     "/artifacts",
     "/tests",
+    "/dist",
     "src/CTlessPET/__pycache__",
 ]

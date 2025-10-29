@@ -16,7 +16,7 @@ def get_models():
             },
         'Pediatric':
             {
-                'Fluorodeoxyglucose': None,
+                'Fluorodeoxyglucose': 'FDG_Pediatric.onnx',
                 'MFBG': None
             }
         }

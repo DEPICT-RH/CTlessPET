@@ -39,7 +39,7 @@ class CTlessPET():
         self.weight = None
         self.tracer = None
         
-        self.NACCT_version = 'V0.1'
+        self.NACCT_version = 'V0.2'
         
         
     def convert_dicom_data(self, input, CT):        
@@ -233,7 +233,7 @@ class CTlessPET():
         NAC_rsl = rsl2(self.NAC)
 
         # Adjust for weight and dose
-        if self.tracer == 'Fluorodeoxyglucose' and self.weight is not None and self.dose is not None:
+        if self.cohort == 'Default' and self.tracer == 'Fluorodeoxyglucose' and self.weight is not None and self.dose is not None:
             const = 3*(self.weight/self.dose)
             if self.verbose:
                 print('\tConstant for adjustment: %s' %const)
