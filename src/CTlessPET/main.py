@@ -156,40 +156,50 @@ class CTlessPET():
             
     # Get mask of CT bed - requires CT is given
     def set_mask(self):
-        
         pt = self.CT_subj
-        
-        # script_dir = os.path.dirname(os.path.abspath(__file__))
-        mask = tio.ScalarImage(get_bed_path())
+        mask = tio.ScalarImage(get_bed_path())  # Load the bed mask image
 
-        # Computes difference in y
-        y_diff = mask.affine[1,3]-pt.CT.affine[1,3]
-        y_voxels = y_diff / pt.CT.spacing[1]
-        y_diff,y_voxels
+        # Calculate voxel shifts in y and z directions
+        y_diff = mask.affine[1, 3] - pt.CT.affine[1, 3]
+        y_voxels = round(y_diff / pt.CT.spacing[1])
 
-        # Computes difference in z
-        z_diff = mask.affine[2,3]-pt.CT.affine[2,3]
-        z_voxels = z_diff / pt.CT.spacing[2]
-        z_diff,z_voxels
+        z_diff = mask.affine[2, 3] - pt.CT.affine[2, 3]
+        z_voxels = round(z_diff / pt.CT.spacing[2])
 
-        # Cuts bed image in z
-        z_start = np.abs(int(z_voxels))
-        z_end = pt.CT.shape[-1]+z_start
-        m = mask.data[:,:,:,z_start:z_end]
+        # Align the mask in the z-direction
+        z_start = max(0, z_voxels)
+        z_end = z_start + pt.CT.shape[-1]
+        if z_end > mask.shape[-1]:
+            z_end = mask.shape[-1]
+            z_start = z_end - pt.CT.shape[-1]  # Ensure consistent size
+            if z_start < 0:
+                raise ValueError("The bed mask cannot align with the CT due to insufficient size in z-dimension.")
 
-        # Shifts bed image in y
-        m2 = np.zeros(m.shape)
-        if (y_voxels > 0):  
-            m2[:,:,int(y_voxels):,:] = m[:,:,:pt.shape[2]-int(y_voxels),:]
+        m = mask.data[:, :, :, z_start:z_end]
+
+        # Align the mask in the y-direction
+        m2 = torch.zeros_like(m)
+        if y_voxels > 0:
+            m2[:, :, y_voxels:, :] = m[:, :, :-y_voxels, :]
         else:
-            m2[:,:,:pt.shape[2]-np.abs(int(y_voxels)),:] = m[:,:,np.abs(int(y_voxels)):,:]
+            m2[:, :, :y_voxels, :] = m[:, :, -y_voxels:, :]
 
-        # Makes affine matrix for registered image
+        # Resize the mask to match the CT size in the z-dimension
+        if m2.shape[-1] < pt.CT.shape[-1]:
+            # Pad in the z-direction if the mask is smaller than the CT
+            pad_z = pt.CT.shape[-1] - m2.shape[-1]
+            m2 = torch.cat([m2, torch.zeros(1, m2.shape[1], m2.shape[2], pad_z)], dim=-1)
+
+        # Ensure the resulting mask matches the CT shape in all dimensions (x, y, z)
+        final_mask = torch.zeros_like(pt.CT.data)
+        final_mask[:, :, :m2.shape[2], :m2.shape[3]] = m2
+
+        # Create affine matrix for registered image
         aff = mask.affine.copy()
-        aff[2,3] = pt.CT.affine[2,3].copy()
-        aff[1,3] = pt.CT.affine[1,3].copy()
+        aff[1:3, 3] = pt.CT.affine[1:3, 3]  # Match y and z translations
 
-        self.bed_mask = tio.ScalarImage(tensor=m2, affine=aff)   
+        # Save the bed mask as a ScalarImage object
+        self.bed_mask = tio.ScalarImage(tensor=final_mask, affine=aff)  
         
             
     # Preprocessing
@@ -219,6 +229,8 @@ class CTlessPET():
             right_y = diff_y-left_y
             crop = tio.transforms.Crop((left_x,right_x,left_y,right_y,0,0))
             subj_conform = crop(subj_conform)
+            self.CT_conform_crop = subj_conform.CT
+        else:
             self.CT_conform_crop = subj_conform.CT
         
         # Resample cropped CT conform to 2mm
@@ -283,7 +295,7 @@ class CTlessPET():
         if self.verbose:
             print("\tPostprocessing")
         
-        subj = tio.Subject(sCT = self.sCT_preproc_space) # Q-Maria: , affine=subject.input0.affine)) ??
+        subj = tio.Subject(sCT = self.sCT_preproc_space) # Q-Maria- Fixed
         
         # De normalize
         inv_norm_ct_normalization = tio.Lambda(lambda x: x*2000.0 - 1024.0)
@@ -292,6 +304,9 @@ class CTlessPET():
         # Resampling sCT from 2mmm
         rsl_from_2mm = tio.transforms.Resample(self.CT_conform_crop)
         subj_conform_cropped = rsl_from_2mm(subj_HU)
+
+        # Set subj_padded to the original input by default
+        subj_padded = subj_conform_cropped
 
         # Padding sCT
         original_CT_shape = 799 # Q-Maria: ??
@@ -307,7 +322,7 @@ class CTlessPET():
             
         # Removing conform
         rsl2 = tio.transforms.Resample(self.CT_path)
-        subj_final = rsl2(subj_padded) # Q-Maria: OBS - fails when above if is false..
+        subj_final = rsl2(subj_padded) # Q-Maria - Fixed
 
         # Inserting bed
         CT_bed = tio.ScalarImage(self.CT_path)
@@ -316,6 +331,7 @@ class CTlessPET():
         sCT_np[mask_rsl_np > 0] = CT_bed_rsl_np[mask_rsl_np > 0]
         tc_sCT = torch.unsqueeze(torch.from_numpy(sCT_np), 0)
         self.subj_final_wBed = tio.ScalarImage(tensor = tc_sCT, affine = subj_final.sCT.affine)
+        print(f"Final sCT shape after postprocessing: {self.subj_final_wBed.shape}")
     
     
     def save_nii(self, output):
@@ -380,6 +396,8 @@ def run(input, CT, output, model, batch_size=1, dose=None, weight=None, verbose=
         inferer.save_dicom(output)
     else:
         inferer.save_nii(output)
+
+    print('Image saved successfully!')
     
 
 def convert_NAC_to_sCT():
