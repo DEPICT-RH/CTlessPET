@@ -41,6 +41,7 @@ class CTlessPET():
             if self.verbose:
                 print("\t[DEBUG] Allocated tmp folder", self.debug_tmp_dir)
         self.tracer = None
+        self.patient_age = None
         
         self.NACCT_version = 'V0.2'
         
@@ -82,6 +83,21 @@ class CTlessPET():
             sorted_dict_NAC = get_sort_files_dict(input)
             self.sorted_dicts = {'CT': sorted_dict_CT['CT'], 'PT': sorted_dict_NAC['PT']}
             
+        # Read first NAC file and extract info
+        d = dcmread(next(iter(self.sorted_dicts['PT'].values())))        
+        self.tracer = d['RadiopharmaceuticalInformationSequence'][0]['Radiopharmaceutical'].value
+        if self.verbose:
+            print(f"\tInferred tracer: {self.tracer}")
+        if 'PatientAge' in d:
+            if d.PatientAge.endswith('Y'):
+                self.patient_age = int(d.PatientAge.replace('Y',''))
+            elif d.PatientAge.endswith('M'):
+                self.patient_age = int(d.PatientAge.replace('M','')) / 12
+            elif d.PatientAge.endswith('D'):
+                self.patient_age = int(d.PatientAge.replace('D','')) / 365
+            if self.verbose:
+                print(f"\tInferred patient age: {self.patient_age:.1f} years")
+                
         if self.verbose:
             print("\tConverting files to nifti")
             start_time = time.time()
@@ -110,10 +126,17 @@ class CTlessPET():
         if model is None:
             if self.tracer is None:
                 raise ValueError('The choice for a model could not be inferred from the input data. Please specify.')
-            elif self.tracer not in get_models()['Default']:
-                raise ValueError(f'Not implemented for the tracer {self.tracer} yet')
-            # TODO: Check for patient age to select children
-            self.cohort = 'Default'
+            else:
+                if self.patient_age is not None and self.patient_age < 18:
+                    if self.verbose:
+                        print(f"\tPatient age {self.patient_age} < 18 years. Using pediatric model for tracer {self.tracer}.")
+                    self.cohort = 'Pediatric'
+                else:
+                    self.cohort = 'Default'
+                    
+                if self.tracer not in get_models()[self.cohort]:
+                    raise ValueError(f'Not implemented for the tracer {self.tracer} yet')
+
         elif model == 'FDG':
             self.cohort = 'Default'
             self.tracer = 'Fluorodeoxyglucose'
@@ -123,11 +146,11 @@ class CTlessPET():
         elif model == 'mFBG_Pediatric':
             raise ValueError(f'Not implemented for the model {model} yet')
             #self.cohort = 'Pediatric'
-            #self.tracer = 'MetaFluorobenzylGuanidine'    
+            #self.tracer = 'MFBG'    
         elif model == 'Cu64DOTATATE':
             raise ValueError(f'Not implemented for the model {model} yet')
             #self.cohort = 'Default'
-            #self.tracer = 'Cu64DOTATATE'
+            #self.tracer = 'DOTATATE'
         else:
             raise ValueError(f'Not implemented for the model {model} yet')
         

@@ -11,12 +11,12 @@ def get_models():
         'Default':
             {
                 'Fluorodeoxyglucose': (['FDG_k0.pt','FDG_k1.pt','FDG_k2.pt'], 'FDG_version'),
-                'Cu64DOTATATE': None
+                'DOTATATE': None
             },
         'Pediatric':
             {
                 'Fluorodeoxyglucose': (['FDG_Pediatric.pt'], 'FDG_Pediatric_version'),
-                'MetaFluorobenzylGuanidine': None
+                'MFBG': None
             }
         }
     
@@ -25,7 +25,8 @@ def get_model_versions():
         'Default':
             {
                 'Fluorodeoxyglucose': 0.2,
-                'Oxygen-water': None
+                'DOTATATE': None,
+                'Oxygen-water': None,
             },
         'Pediatric':
             {
