@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "CTlessPET"
-version = "0.2.2"
+version = "0.2.3"
 authors = [
     { name="Claes Ladefoged", email="claes.noehr.ladefoged@regionh.dk" },
 ]
@@ -21,8 +21,8 @@ dependencies = [
     "torch >= 2.5.0",
     "numpy",
     "torchio",
-    "pydicom",
-    "dicom2nifti",
+    "pydicom == 2.4.4",
+    "dicom2nifti == 2.4.9",
     "nibabel"
 ]
 
