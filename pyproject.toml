@@ -26,6 +26,9 @@ dependencies = [
     "nibabel"
 ]
 
+[project.optional-dependencies]
+gdcm = ["python-gdcm >= 3.0.22"]
+
 [project.urls]
 Homepage = "https://github.com/depict-rh/CTlessPET"
 Issues = "https://github.com/depict-rh/CTlessPET/issues"
