@@ -18,10 +18,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch >= 2.0.0",
+    "torch >= 2.5.0",
     "numpy",
     "torchio",
-    "onnxruntime-gpu",
     "pydicom",
     "dicom2nifti",
     "nibabel"

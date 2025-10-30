@@ -6,7 +6,6 @@ import tempfile
 import time
 import subprocess as subp
 from multiprocessing import Process
-import onnxruntime
 import torchio as tio
 import numpy as np
 from torch.utils.data import DataLoader
@@ -15,9 +14,10 @@ from pydicom import dcmread
 from CTlessPET.utils import (
     maybe_download_weights,
     get_models,
-    get_model_path,
+    get_model_paths,
     get_bed_path,
-    percentile_norm
+    get_preprocessing_transform,
+    de_normalize
 )
 from CTlessPET.dicom_io import (
     get_sort_files_dict,
@@ -26,17 +26,20 @@ from CTlessPET.dicom_io import (
 import shutil
 import dicom2nifti
 from tqdm import tqdm
-import nibabel as nib
 
 #suppress warnings
 warnings.filterwarnings('ignore')
 
 
 class CTlessPET():
-    def __init__(self, verbose=False):
+    def __init__(self, debug=False, verbose=False):
         self.verbose = verbose
-        self.dose = None
-        self.weight = None
+        self.debug = debug
+        if self.debug is not None:
+            self.debug_tmp_dir = Path(self.debug)
+            Path(self.debug_tmp_dir).mkdir(exist_ok=True, parents=True)
+            if self.verbose:
+                print("\t[DEBUG] Allocated tmp folder", self.debug_tmp_dir)
         self.tracer = None
         
         self.NACCT_version = 'V0.2'
@@ -78,13 +81,6 @@ class CTlessPET():
             sorted_dict_CT = get_sort_files_dict(CT)
             sorted_dict_NAC = get_sort_files_dict(input)
             self.sorted_dicts = {'CT': sorted_dict_CT['CT'], 'PT': sorted_dict_NAC['PT']}
-    
-        # Read first NAC file and extract info
-        d = dcmread(next(iter(self.sorted_dicts['PT'].values())))        
-        weight = d.PatientWeight
-        dose = d['RadiopharmaceuticalInformationSequence'][0]['RadionuclideTotalDose'].value / 1000000
-        tracer = d['RadiopharmaceuticalInformationSequence'][0]['Radiopharmaceutical'].value
-        self.set_dose_and_weight_and_tracer(dose=dose, weight=weight, tracer=tracer)
             
         if self.verbose:
             print("\tConverting files to nifti")
@@ -96,6 +92,10 @@ class CTlessPET():
         if self.verbose:
             print(f'\tConverting files to nifti done in {time.time()-start_time:.01f} seconds')
             
+        if self.debug:
+            shutil.copyfile(path_CT_nii, self.debug_tmp_dir / 'CT.nii.gz')
+            shutil.copyfile(path_NAC_nii, self.debug_tmp_dir / 'NAC.nii.gz')
+
         return path_NAC_nii, path_CT_nii
     
 
@@ -104,7 +104,7 @@ class CTlessPET():
         
 
     # Sets up variables
-    def setup(self, model): # Model = FDG, FDG_Pediatric, H2O
+    def setup(self, model, fast): # Model = FDG, FDG_Pediatric
         
         # Get the type of model from the DICOM data if not already set
         if model is None:
@@ -120,19 +120,35 @@ class CTlessPET():
         elif model == 'FDG_Pediatric':
             self.cohort = 'Pediatric'
             self.tracer = 'Fluorodeoxyglucose'
-        elif model == 'H2O':
-            self.cohort = 'Default'
-            self.tracer = 'Oxygen-water'    
+        elif model == 'mFBG_Pediatric':
+            raise ValueError(f'Not implemented for the model {model} yet')
+            #self.cohort = 'Pediatric'
+            #self.tracer = 'MetaFluorobenzylGuanidine'    
+        elif model == 'Cu64DOTATATE':
+            raise ValueError(f'Not implemented for the model {model} yet')
+            #self.cohort = 'Default'
+            #self.tracer = 'Cu64DOTATATE'
         else:
             raise ValueError(f'Not implemented for the model {model} yet')
+        
+        # Set the size of the cropped area
+        if self.cohort == 'Default':
+            self.crop_size = [350,300]
+        elif self.cohort == 'Pediatric':
+            self.crop_size = [300,300]
 
         # Get the model
         maybe_download_weights(self.cohort, self.tracer)
         if self.verbose:
             print("\tLoading model")
-        self.model = onnxruntime.InferenceSession(
-            get_model_path(self.cohort, self.tracer), 
-            providers=['CUDAExecutionProvider'])
+        self.models = []
+        for model_path in get_model_paths(self.cohort, self.tracer):
+            model = torch.jit.load(model_path)
+            model.to("cuda")
+            model.eval()
+            self.models.append(model)
+            if fast:
+                break # Only use the first model if fast inference is requested
         if self.verbose:
             print(f"\tModel {self.cohort}_{self.tracer} loaded")
 
@@ -140,66 +156,13 @@ class CTlessPET():
         self.patch_size = [128,128,32]
         self.patch_overlap = (70,70,24)
         self.data_shape_in = [1] + self.patch_size
-        
-        self.input_name = self.model.get_inputs()[0].name
-        
-        
-    # Overwrite dose and/or weight
-    def set_dose_and_weight_and_tracer(self, dose=None, weight=None, tracer=None):
-        if dose is not None:
-            self.dose = dose
-        if weight is not None:
-            self.weight = weight
-        if tracer is not None:
-            self.tracer = tracer
             
             
     # Get mask of CT bed - requires CT is given
     def set_mask(self):
         pt = self.CT_subj
-        mask = tio.ScalarImage(get_bed_path())  # Load the bed mask image
-
-        # Calculate voxel shifts in y and z directions
-        y_diff = mask.affine[1, 3] - pt.CT.affine[1, 3]
-        y_voxels = round(y_diff / pt.CT.spacing[1])
-
-        z_diff = mask.affine[2, 3] - pt.CT.affine[2, 3]
-        z_voxels = round(z_diff / pt.CT.spacing[2])
-
-        # Align the mask in the z-direction
-        z_start = max(0, z_voxels)
-        z_end = z_start + pt.CT.shape[-1]
-        if z_end > mask.shape[-1]:
-            z_end = mask.shape[-1]
-            z_start = z_end - pt.CT.shape[-1]  # Ensure consistent size
-            if z_start < 0:
-                raise ValueError("The bed mask cannot align with the CT due to insufficient size in z-dimension.")
-
-        m = mask.data[:, :, :, z_start:z_end]
-
-        # Align the mask in the y-direction
-        m2 = torch.zeros_like(m)
-        if y_voxels > 0:
-            m2[:, :, y_voxels:, :] = m[:, :, :-y_voxels, :]
-        else:
-            m2[:, :, :y_voxels, :] = m[:, :, -y_voxels:, :]
-
-        # Resize the mask to match the CT size in the z-dimension
-        if m2.shape[-1] < pt.CT.shape[-1]:
-            # Pad in the z-direction if the mask is smaller than the CT
-            pad_z = pt.CT.shape[-1] - m2.shape[-1]
-            m2 = torch.cat([m2, torch.zeros(1, m2.shape[1], m2.shape[2], pad_z)], dim=-1)
-
-        # Ensure the resulting mask matches the CT shape in all dimensions (x, y, z)
-        final_mask = torch.zeros_like(pt.CT.data)
-        final_mask[:, :, :m2.shape[2], :m2.shape[3]] = m2
-
-        # Create affine matrix for registered image
-        aff = mask.affine.copy()
-        aff[1:3, 3] = pt.CT.affine[1:3, 3]  # Match y and z translations
-
-        # Save the bed mask as a ScalarImage object
-        self.bed_mask = tio.ScalarImage(tensor=final_mask, affine=aff)  
+        mask = tio.LabelMap(get_bed_path())  # Load the bed mask image
+        self.bed_mask = tio.Resample(pt.CT)(mask)  # Resample the bed mask to match CT spacing
         
             
     # Preprocessing
@@ -209,140 +172,123 @@ class CTlessPET():
         self.CT_path = CT
         
         # Load CT
-        self.CT_subj = tio.Subject(CT=tio.ScalarImage(self.CT_path))
+        self.CT_subj = tio.Subject(CT = tio.ScalarImage(self.CT_path))
         
         # Compute BED mask from CT if set
         self.set_mask()
 
-        # Resample CT to CT conform
-        rsl_conform = tio.transforms.Resample((0.976562,0.976562,2))
-        subj_conform = rsl_conform(self.CT_subj)
+        # Resample CT to 2mm
+        rsl_2mm = tio.Resample(2)
+        ct_rsl = rsl_2mm(self.CT_subj.CT)
 
-        # Cropping image to 512x512
-        xy_original_ct = 512
-        if xy_original_ct < subj_conform.CT.shape[1]:
-            diff_x = subj_conform.CT.shape[1]-xy_original_ct
-            left_x = diff_x//2
-            right_x = diff_x-left_x
-            diff_y = subj_conform.CT.shape[2]-xy_original_ct
-            left_y = diff_y//2
-            right_y = diff_y-left_y
-            crop = tio.transforms.Crop((left_x,right_x,left_y,right_y,0,0))
-            subj_conform = crop(subj_conform)
-            self.CT_conform_crop = subj_conform.CT
-        else:
-            self.CT_conform_crop = subj_conform.CT
+        # Load NAC and resampled CT into subject
+        subj = tio.Subject(
+            nac = tio.ScalarImage(self.NAC_path),
+            ct = ct_rsl
+        )
         
-        # Resample cropped CT conform to 2mm
-        rsl = tio.transforms.Resample(2)
-        subj_rsl = rsl(subj_conform)
-
-        # Load NAC
-        self.NAC = tio.ScalarImage(self.NAC_path)
+        # Resample NAC to 2mm CT
+        rsl_ct = tio.Resample('ct')
+        subj_rsl = rsl_ct(subj)
         
-        # Resample NAC to CT 2mm
-        rsl2 = tio.transforms.Resample(subj_rsl.CT)
-        NAC_rsl = rsl2(self.NAC)
-
-        # Adjust for weight and dose
-        if self.cohort == 'Default' and self.tracer == 'Fluorodeoxyglucose' and self.weight is not None and self.dose is not None:
-            const = 3*(self.weight/self.dose)
-            if self.verbose:
-                print('\tConstant for adjustment: %s' %const)
-            NAC_rsl.set_data(NAC_rsl.data*const)
-            
-        # Padding (if needed)
-        if (padding := self.patch_size[0] > NAC_rsl.shape[1]):
-            diff_x = self.patch_size[0]-NAC_rsl.shape[1] # 256-249 = 7
-            left_x = diff_x//2
-            right_x = diff_x-left_x
-            diff_y = self.patch_size[1]-NAC_rsl.shape[2] # 256-249 = 7
-            left_y = diff_y//2
-            right_y = diff_y-left_y
-            self.pad = tio.transforms.Pad((left_x,right_x,left_y,right_y,0,0))
-            NAC_rsl = self.pad(NAC_rsl)
-        self.padding = padding
-
+        # Crop
+        # TODO:
+        # - Should be guided by a foreground mask!
+        # - 
+        crop = tio.CropOrPad((self.crop_size[0],self.crop_size[1],subj_rsl.nac.shape[-1]))
+        subj_rsl_crop = crop(subj_rsl)
+        
         # Normalize
-        norm_pet_percentile_normalization = tio.Lambda(lambda x: percentile_norm(x))
-        self.NAC_preprocessed = norm_pet_percentile_normalization(NAC_rsl)
-
+        norm_pet_percentile_normalization = tio.RescaleIntensity(out_min_max=(0,1), percentiles=(0.5, 99.5), masking_method=lambda x: x > 50, include=['nac'])
+        subj_rsl_crop_norm = norm_pet_percentile_normalization(subj_rsl_crop)
+        
+        # Transform
+        preproc = get_preprocessing_transform()
+        self.NAC_preprocessed = preproc(subj_rsl_crop_norm.nac)
+        
+        if self.debug:
+            self.NAC_preprocessed.save(self.debug_tmp_dir / 'NAC_preprocessed.nii.gz')
+            
 
     def inference(self, bs=1):        
         subject = tio.Subject(img=self.NAC_preprocessed)
         grid_sampler = tio.data.GridSampler(subject, self.patch_size, self.patch_overlap, padding_mode='constant')
         patch_loader = DataLoader(grid_sampler, batch_size=bs)
-        aggregator = tio.data.GridAggregator(grid_sampler, overlap_mode='hann')
         
         if self.verbose:
-            print('\tStarting inference')
+            print(f'\tStarting inference with {len(self.models)} model(s)...')
             start_time = time.time()
-        
-        for patches_batch in tqdm(patch_loader):
-            patch_x = patches_batch['img'][tio.DATA].float().numpy()
-            locations = patches_batch[tio.LOCATION]
-            ort_outs = self.model.run(None, {self.input_name: patch_x})
-            patch_y = torch.from_numpy(ort_outs[0])
-            aggregator.add_batch(patch_y, locations)
+            
+        sCT_stack = []
+        for model_ind, model in enumerate(self.models):
+            if self.verbose:
+                print(f'\t\tUsing model fold {model_ind}..')
+            
+            aggregator = tio.data.GridAggregator(grid_sampler, overlap_mode='hann')
+            with torch.no_grad():
+                for patches_batch in tqdm(patch_loader):
+                    patch_x = patches_batch['img'][tio.DATA].to('cuda')
+                    locations = patches_batch[tio.LOCATION]
+                    patch_y = model(patch_x)
+                    aggregator.add_batch(patch_y.float().cpu(), locations)
+            sCT_stack.append(aggregator.get_output_tensor().cpu())
+        if len(sCT_stack) == 1:
+            sCT_tensor = sCT_stack[0]
+        else:
+            stacked_tensor = torch.stack(sCT_stack, dim=0)
+            sCT_tensor = torch.median(stacked_tensor, dim=0).values
 
-        self.sCT_preproc_space = tio.ScalarImage(tensor=aggregator.get_output_tensor(), affine=self.NAC_preprocessed.affine)
+        self.sCT_preproc_space = tio.ScalarImage(tensor=sCT_tensor, affine=self.NAC_preprocessed.affine)
         if self.verbose:
             print(f'\tInference done in {time.time()-start_time:.01f} seconds')
+        if self.debug:
+            self.sCT_preproc_space.save(self.debug_tmp_dir / 'sCT_preproc_space.nii.gz')
             
             
-    def postprocess(self):
+    def postprocess(self, insert_bed=True):
         
         if self.verbose:
             print("\tPostprocessing")
         
-        subj = tio.Subject(sCT = self.sCT_preproc_space) # Q-Maria- Fixed
-        
-        # De normalize
-        inv_norm_ct_normalization = tio.Lambda(lambda x: x*2000.0 - 1024.0)
-        subj_HU = inv_norm_ct_normalization(subj)
+        subj = tio.Subject(sCT = self.sCT_preproc_space)
     
-        # Resampling sCT from 2mmm
-        rsl_from_2mm = tio.transforms.Resample(self.CT_conform_crop)
-        subj_conform_cropped = rsl_from_2mm(subj_HU)
+        # Resampling sCT to CT spacing
+        rsl_from_2mm = tio.transforms.Resample(self.CT_subj.CT)
+        subj_rslCT = rsl_from_2mm(subj)
+        
+        if self.debug:
+            subj_rslCT.sCT.save(self.debug_tmp_dir / 'sCT_rslCT.nii.gz')
 
-        # Set subj_padded to the original input by default
-        subj_padded = subj_conform_cropped
+        # De normalize (back to HU at 120kvp)
+        inv_norm_ct_normalization = tio.Lambda(lambda x: de_normalize(x))
+        subj_HU = inv_norm_ct_normalization(subj_rslCT)
+        
+        if self.debug:
+            subj_HU.sCT.save(self.debug_tmp_dir / 'sCT_rslCT_HU.nii.gz')
 
-        # Padding sCT
-        original_CT_shape = 799 # Q-Maria: ??
-        if subj_conform_cropped.sCT.shape[0] < original_CT_shape:
-            diff_x = original_CT_shape-subj_conform_cropped.sCT.shape[1] # 256-249 = 7
-            left_x = diff_x//2
-            right_x = diff_x-left_x
-            diff_y = original_CT_shape-subj_conform_cropped.sCT.shape[2] # 256-249 = 7
-            left_y = diff_y//2
-            right_y = diff_y-left_y
-            pad = tio.Pad((left_x,right_x,left_y,right_y,0,0), padding_mode=-1024)
-            subj_padded = pad(subj_conform_cropped)
-            
-        # Removing conform
-        rsl2 = tio.transforms.Resample(self.CT_path)
-        subj_final = rsl2(subj_padded) # Q-Maria - Fixed
-
-        # Inserting bed
-        CT_bed = tio.ScalarImage(self.CT_path)
-        (sCT_np, CT_bed_rsl_np, mask_rsl_np) = (subj_final.sCT.data.numpy()[0], CT_bed.data.numpy()[0], self.bed_mask.data.numpy()[0])
-
-        sCT_np[mask_rsl_np > 0] = CT_bed_rsl_np[mask_rsl_np > 0]
-        tc_sCT = torch.unsqueeze(torch.from_numpy(sCT_np), 0)
-        self.subj_final_wBed = tio.ScalarImage(tensor = tc_sCT, affine = subj_final.sCT.affine)
-        print(f"Final sCT shape after postprocessing: {self.subj_final_wBed.shape}")
+        if insert_bed:
+            # Inserting bed
+            CT_bed = tio.ScalarImage(self.CT_path)
+            (sCT_np, CT_bed_rsl_np, mask_rsl_np) = (subj_HU.sCT.data.numpy()[0], CT_bed.data.numpy()[0], self.bed_mask.data.numpy()[0])
+            sCT_np[mask_rsl_np > 0] = CT_bed_rsl_np[mask_rsl_np > 0]
+            tc_sCT = torch.unsqueeze(torch.from_numpy(sCT_np), 0)
+            self.sCT_final = tio.ScalarImage(tensor = tc_sCT, affine = subj_HU.sCT.affine)
+        else:
+            self.sCT_final = subj_HU.sCT
+        
+        if self.debug:
+            self.sCT_final.save(self.debug_tmp_dir / 'sCT_final.nii.gz')
     
     
     def save_nii(self, output):
-        self.subj_final_wBed.save(output)
+        self.sCT_final.save(output)
         
     
     def save_dicom(self, output):        
         if self.verbose:
             print('\tMaking DICOM')
         
-        np_nifti = self.subj_final_wBed.numpy()[0]
+        np_nifti = self.sCT_final.numpy()[0]
 
         # Force values to lie within a range accepted by the dicom container
         np_nifti = np.maximum( np_nifti, -1024 )
@@ -368,8 +314,8 @@ class CTlessPET():
         self.clean()
 
 
-def run(input, CT, output, model, batch_size=1, dose=None, weight=None, verbose=False):
-    inferer = CTlessPET(verbose)
+def run(input, CT, output, model, insert_bed=True, batch_size=1, fast=False, debug=False, verbose=False):
+    inferer = CTlessPET(debug=debug, verbose=verbose)
     
     img_type = "nifti" if str(input).endswith(".nii") or str(input).endswith(".nii.gz") else "dicom"
         
@@ -382,15 +328,13 @@ def run(input, CT, output, model, batch_size=1, dose=None, weight=None, verbose=
     else:
         raise ValueError('You gave a nifty (NAC) file as input but forgot to give a CT file as well.')
         
-    inferer.setup(model)
-    
-    inferer.set_dose_and_weight_and_tracer(dose, weight)
+    inferer.setup(model, fast)
         
     inferer.preprocess(NAC, CT)
     
     inferer.inference(batch_size)
     
-    inferer.postprocess()
+    inferer.postprocess(insert_bed)
     
     if img_type == 'dicom':
         inferer.save_dicom(output)
@@ -422,8 +366,9 @@ def convert_NAC_to_sCT():
     parser.add_argument("-o", "--output", help="Input file (nifti) or directory (dicom). Must be the same format as input.", type=str)
     parser.add_argument("-m", "--model", help="Chose a model to use. Will overwrite the choice automatically selected when using dicom data.", choices=['FDG','FDG_Pediatric','H2O'], type=str)
     parser.add_argument("-b", "--batch_size", help="Batch size", type=int, default=1)
-    parser.add_argument("-d", "--dose", help="Injected dose", type=float)
-    parser.add_argument("-w", "--weight", help="Patient weight", type=float)
+    parser.add_argument("-f", "--fast", help="Only infer using a single fold/model. Default is to use all available folds.", action='store_true')
+    parser.add_argument("--no_bed", help="Do not insert the CT bed from CT container into the synthetic CT (Default is on).", action='store_false')
+    parser.add_argument("-d", "--debug_dir", help="Debug by saving intermediate results to this directory", type=str, default=None)
     parser.add_argument("-v", "--verbose", help="Add verbosity", action='store_true')
     args = parser.parse_args()
     
@@ -432,9 +377,10 @@ def convert_NAC_to_sCT():
         CT = args.CT,
         output = args.output,
         model = args.model,
+        insert_bed = not args.no_bed,
         batch_size = args.batch_size,
-        dose = args.dose,
-        weight = args.weight,
+        fast = args.fast,
+        debug = args.debug_dir,
         verbose = args.verbose
     )
     
