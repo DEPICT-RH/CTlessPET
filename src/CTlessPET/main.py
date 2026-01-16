@@ -189,7 +189,7 @@ class CTlessPET():
         
             
     # Preprocessing
-    def preprocess(self, NAC, CT):
+    def preprocess(self, NAC, CT, normalization_masking_threshold=50):
         
         self.NAC_path = NAC
         self.CT_path = CT
@@ -222,7 +222,7 @@ class CTlessPET():
         subj_rsl_crop = crop(subj_rsl)
         
         # Normalize
-        norm_pet_percentile_normalization = tio.RescaleIntensity(out_min_max=(0,1), percentiles=(0.5, 99.5), masking_method=lambda x: x > 50, include=['nac'])
+        norm_pet_percentile_normalization = tio.RescaleIntensity(out_min_max=(0,1), percentiles=(0.5, 99.5), masking_method=lambda x: x > normalization_masking_threshold, include=['nac'])
         subj_rsl_crop_norm = norm_pet_percentile_normalization(subj_rsl_crop)
         
         # Transform
@@ -337,7 +337,7 @@ class CTlessPET():
         self.clean()
 
 
-def run(input, CT, output, model, insert_bed=True, batch_size=1, fast=False, debug=False, verbose=False):
+def run(input, CT, output, model, insert_bed=True, normalization_masking_threshold=50, batch_size=1, fast=False, debug=False, verbose=False):
     inferer = CTlessPET(debug=debug, verbose=verbose)
     
     img_type = "nifti" if str(input).endswith(".nii") or str(input).endswith(".nii.gz") else "dicom"
@@ -353,7 +353,7 @@ def run(input, CT, output, model, insert_bed=True, batch_size=1, fast=False, deb
         
     inferer.setup(model, fast)
         
-    inferer.preprocess(NAC, CT)
+    inferer.preprocess(NAC, CT, normalization_masking_threshold=normalization_masking_threshold)
     
     inferer.inference(batch_size)
     
@@ -391,6 +391,7 @@ def convert_NAC_to_sCT():
     parser.add_argument("-b", "--batch_size", help="Batch size", type=int, default=1)
     parser.add_argument("-f", "--fast", help="Only infer using a single fold/model. Default is to use all available folds.", action='store_true')
     parser.add_argument("--no_bed", help="Do not insert the CT bed from CT container into the synthetic CT (Default is on).", action='store_false')
+    parser.add_argument("--normalization_masking_threshold", default=50, type=int, help="Lower threshold to calculate percentiles on NAC image. Set this to zero if your intensities are low (e.g. low-dose PET or short acquisitions)")
     parser.add_argument("-d", "--debug_dir", help="Debug by saving intermediate results to this directory", type=str, default=None)
     parser.add_argument("-v", "--verbose", help="Add verbosity", action='store_true')
     args = parser.parse_args()
@@ -401,6 +402,7 @@ def convert_NAC_to_sCT():
         output = args.output,
         model = args.model,
         insert_bed = not args.no_bed,
+        normalization_masking_threshold = args.normalization_masking_threshold,
         batch_size = args.batch_size,
         fast = args.fast,
         debug = args.debug_dir,
